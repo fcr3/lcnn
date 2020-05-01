@@ -170,8 +170,6 @@ class HourglassNet(nn.Module):
         x = self.maxpool(x)
         x = self.layer2(x)
         x = self.layer3(x)
-        
-        print(x.shape)
 
         for i in range(self.num_stacks):
             y = self.hg[i](x)

@@ -13,70 +13,47 @@ FEATURE_DIM = 8
 
 
 class LineVectorizer(nn.Module):
-    def __init__(self, backbone):
+    def __init__(self, fc1, fc2):
         super().__init__()
-        self.backbone = backbone
-
+        
         lambda_ = torch.linspace(0, 1, M.n_pts0)[:, None]
         self.register_buffer("lambda_", lambda_)
         self.do_static_sampling = M.n_stc_posl + M.n_stc_negl > 0
 
-        self.fc1 = nn.Conv2d(256, M.dim_loi, 1)
+        self.fc1 = fc1
         scale_factor = M.n_pts0 // M.n_pts1
-        if M.use_conv:
-            self.pooling = nn.Sequential(
-                nn.MaxPool1d(scale_factor, scale_factor),
-                Bottleneck1D(M.dim_loi, M.dim_loi),
-            )
-            self.fc2 = nn.Sequential(
-                nn.ReLU(inplace=True), nn.Linear(M.dim_loi * M.n_pts1 + FEATURE_DIM, 1)
-            )
-        else:
-            self.pooling = nn.MaxPool1d(scale_factor, scale_factor)
-            self.fc2 = nn.Sequential(
-                nn.Linear(M.dim_loi * M.n_pts1 + FEATURE_DIM, M.dim_fc),
-                nn.ReLU(inplace=True),
-                nn.Linear(M.dim_fc, M.dim_fc),
-                nn.ReLU(inplace=True),
-                nn.Linear(M.dim_fc, 1),
-            )
+
+        self.pooling = nn.MaxPool1d(scale_factor, scale_factor)
+        self.fc2 = fc2
         self.loss = nn.BCEWithLogitsLoss(reduction="none")
 
-    def forward(self, input_dict):
-        result = self.backbone(input_dict)
+    def forward(self, result, input_dict):
         h = result["preds"]
-        
-        # for deducing input shape of fc1
-        # print("fc1 expected input:", result["feature"].shape)
-        
-        x = self.fc1(result["feature"])
+
+        x = self.fc1.infer({
+            next(iter(self.fc1.inputs)): result["feature"]
+        })[next(iter(self.fc1.outputs))]
         n_batch, n_channel, row, col = x.shape
 
         xs, ys, fs, ps, idx, jcs = [], [], [], [], [0], []
         for i, meta in enumerate(input_dict["meta"]):
             p, label, feat, jc = self.sample_lines(
-                meta, h["jmap"][i], h["joff"][i], input_dict["mode"]
+                meta, h["jmap"][i], h["joff"][i]
             )
-            # print("p.shape:", p.shape)
+
             ys.append(label)
-            if input_dict["mode"] == "training" and self.do_static_sampling:
-                p = torch.cat([p, meta["lpre"]])
-                feat = torch.cat([feat, meta["lpre_feat"]])
-                ys.append(meta["lpre_label"])
-                del jc
-            else:
-                jcs.append(jc)
-                ps.append(p)
+            jcs.append(jc)
+            ps.append(p)
             fs.append(feat)
 
             p = p[:, 0:1, :] * self.lambda_ + p[:, 1:2, :] * (1 - self.lambda_) - 0.5
             p = p.reshape(-1, 2)  # [N_LINE x N_POINT, 2_XY]
             px, py = p[:, 0].contiguous(), p[:, 1].contiguous()
-            px0 = px.floor().clamp(min=0, max=127)
-            py0 = py.floor().clamp(min=0, max=127)
-            px1 = (px0 + 1).clamp(min=0, max=127)
-            py1 = (py0 + 1).clamp(min=0, max=127)
-            px0l, py0l, px1l, py1l = px0.long(), py0.long(), px1.long(), py1.long()
+            px0 = np.clip(np.floor(px), a_min=0, a_max=127)
+            py0 = np.clip(np.floor(py), a_min=0, a_max=127)
+            px1 = np.clip(px0 + 1, a_min=0, a_max=127)
+            py1 = np.clip(py0 + 1, a_min=0, a_max=127)
+            px0l, py0l, px1l, py1l = px0, py0, px1, py1
 
             # xp: [N_LINE, N_CHANNEL, N_POINT]
             xp = (
@@ -105,9 +82,13 @@ class LineVectorizer(nn.Module):
         # for deducing input shape of fc2
         # print("pooling expected input:", x.shape)
         
-        x = self.fc2(x).flatten()
+        x = self.fc2.infer({
+            next(iter(self.fc2.inputs)): x.detach().numpy()
+        })[next(iter(self.fc2.outputs))]
+        x = x.flatten()
+        # x = self.fc2(x).flatten()
 
-        if input_dict["mode"] != "training":
+        if True:
             p = torch.cat(ps)
             s = torch.sigmoid(x)
             b = s > 0.5
@@ -141,27 +122,9 @@ class LineVectorizer(nn.Module):
                     [jcs[i][1] for i in range(n_batch)]
                 )
 
-        if input_dict["mode"] != "testing":
-            y = torch.cat(ys)
-            loss = self.loss(x, y)
-            lpos_mask, lneg_mask = y, 1 - y
-            loss_lpos, loss_lneg = loss * lpos_mask, loss * lneg_mask
-
-            def sum_batch(x):
-                xs = [x[idx[i] : idx[i + 1]].sum()[None] for i in range(n_batch)]
-                return torch.cat(xs)
-
-            lpos = sum_batch(loss_lpos) / sum_batch(lpos_mask).clamp(min=1)
-            lneg = sum_batch(loss_lneg) / sum_batch(lneg_mask).clamp(min=1)
-            result["losses"][0]["lpos"] = lpos * M.loss_weight["lpos"]
-            result["losses"][0]["lneg"] = lneg * M.loss_weight["lneg"]
-
-        if input_dict["mode"] == "training":
-            del result["preds"]
-
         return result
 
-    def sample_lines(self, meta, jmap, joff, mode):
+    def sample_lines(self, meta, jmap, joff):
         with torch.no_grad():
             junc = meta["junc"]  # [N, 2]
             jtyp = meta["jtyp"]  # [N]
@@ -173,10 +136,9 @@ class LineVectorizer(nn.Module):
             joff = joff.reshape(n_type, 2, -1)
             max_K = M.n_dyn_junc // n_type
             N = len(junc)
-            if mode != "training":
-                K = min(int((jmap > M.eval_junc_thres).float().sum().item()), max_K)
-            else:
-                K = min(int(N * 2 + 2), max_K)
+            
+            K = min(int((jmap > M.eval_junc_thres).float().sum().item()), max_K)
+            
             if K < 2:
                 K = 2
             device = jmap.device
@@ -208,30 +170,7 @@ class LineVectorizer(nn.Module):
             up, vp = match[u], match[v]
             label = Lpos[up, vp]
 
-            if mode == "training":
-                c = torch.zeros_like(label, dtype=torch.bool)
-
-                # sample positive lines
-                cdx = label.nonzero().flatten()
-                if len(cdx) > M.n_dyn_posl:
-                    # print("too many positive lines")
-                    perm = torch.randperm(len(cdx), device=device)[: M.n_dyn_posl]
-                    cdx = cdx[perm]
-                c[cdx] = 1
-
-                # sample negative lines
-                cdx = Lneg[up, vp].nonzero().flatten()
-                if len(cdx) > M.n_dyn_negl:
-                    # print("too many negative lines")
-                    perm = torch.randperm(len(cdx), device=device)[: M.n_dyn_negl]
-                    cdx = cdx[perm]
-                c[cdx] = 1
-
-                # sample other (unmatched) lines
-                cdx = torch.randint(len(c), (M.n_dyn_othr,), device=device)
-                c[cdx] = 1
-            else:
-                c = (u < v).flatten()
+            c = (u < v).flatten()
 
             # sample lines
             u, v, label = u[c], v[c], label[c]

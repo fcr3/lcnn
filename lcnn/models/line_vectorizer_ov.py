@@ -149,6 +149,11 @@ class LineVectorizer(nn.Module):
             x = (index % 128).float() + torch.gather(joff[:, 1], 1, index) + 0.5
 
             # xy: [N_TYPE, K, 2]
+            print(x)
+            print(y)
+            print(y[..., None])
+            print(x[..., None])
+            
             xy = torch.cat([y[..., None], x[..., None]], dim=-1)
             xy_ = xy[..., None, :]
             del x, y, index

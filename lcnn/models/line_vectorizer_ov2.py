@@ -1,8 +1,10 @@
 import itertools
 import random
 from collections import defaultdict
+import time
 
 import numpy as np
+import ray
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -30,7 +32,7 @@ class LineVectorizer(nn.Module):
         self.loss = nn.BCEWithLogitsLoss(reduction="none")
         
         self.fc2_batch_size = 0
-
+        
     def forward(self, result, input_dict):
         h = result["preds"]
         h["jmap"] = torch.from_numpy(h["jmap"]).float().to(self.device_used)
@@ -46,11 +48,14 @@ class LineVectorizer(nn.Module):
         n_batch, n_channel, row, col = x.shape
 
         xs, ys, fs, ps, idx, jcs = [], [], [], [], [0], []
+        
+        start1 = time.time()
         for i, meta in enumerate(input_dict["meta"]):
             p, label, feat, jc = self.sample_lines(
                 meta, h["jmap"][i], h["joff"][i], input_dict["mode"]
             )
             # print("p.shape:", p.shape)
+            # print("label", label.shape)
             ys.append(label)
             jcs.append(jc)
             ps.append(p)
@@ -79,12 +84,18 @@ class LineVectorizer(nn.Module):
             
             # for deducing input shape of pooling
             # print("pooling expected input:", xp.shape)
-            
+            # print(self.pooling)
+            # print(xp.shape)
             xp = self.pooling(xp)
+            # print(xp.shape)
             xs.append(xp)
             idx.append(idx[-1] + xp.shape[0])
-
+            # print("idx", idx)
+        
+        stamp1 = time.time() - start1
+        
         x, y = torch.cat(xs), torch.cat(ys)
+        # print(x.shape, y.shape)
         f = torch.cat(fs)
         x = x.reshape(-1, M.n_pts1 * M.dim_loi)
         x = torch.cat([x, f], 1)
@@ -94,6 +105,7 @@ class LineVectorizer(nn.Module):
         # print("pooling expected input:", x.shape)
         
         if self.fc2_batch_size != x.shape[0]:
+            # print("batch size change")
             self.fc2_batch_size = x.shape[0]
             input_layer = next(iter(self.fc2_unloaded.inputs))
             self.fc2_unloaded.reshape({input_layer: x.shape})
@@ -101,16 +113,20 @@ class LineVectorizer(nn.Module):
                                             device_name='CPU', 
                                             num_requests=1)
         
+        start2 = time.time()
         x = self.fc2.infer({
             next(iter(self.fc2.inputs)): x
         })[next(iter(self.fc2.outputs))]
         x = torch.from_numpy(x).float().to(self.device_used).flatten()
-
+        stamp2 = time.time() - start2
+        
         p = torch.cat(ps)
         s = torch.sigmoid(x)
         b = s > 0.5
         lines = []
         score = []
+        
+        start3 = time.time()
         for i in range(n_batch):
             p0 = p[idx[i] : idx[i + 1]]
             s0 = s[idx[i] : idx[i + 1]]
@@ -131,6 +147,7 @@ class LineVectorizer(nn.Module):
                 jcs[i][j] = jcs[i][j][
                     None, torch.arange(M.n_out_junc) % len(jcs[i][j])
                 ]
+        stamp3 = time.time() - start3
         
         result["preds"]["lines"] = torch.cat(lines).detach().cpu().numpy()
         result["preds"]["score"] = torch.cat(score).detach().cpu().numpy()
@@ -143,7 +160,11 @@ class LineVectorizer(nn.Module):
 
         result["preds"]['jmap'] = result["preds"]['jmap'].detach().cpu().numpy()
         result['preds']['joff'] = result['preds']['joff'].detach().cpu().numpy()
-        return result
+        
+        def trunc(values, decs=0):
+            return np.trunc(values*10**decs)/(10**decs)
+        
+        return result, str(trunc(np.array([stamp1, stamp2, stamp3]), decs=4))
 
     def sample_lines(self, meta, jmap, joff, mode):
         with torch.no_grad():
@@ -163,6 +184,9 @@ class LineVectorizer(nn.Module):
                 K = min(int(N * 2 + 2), max_K)
             if K < 2:
                 K = 2
+                
+            # print("K:", K)
+            # print("N:", N)
             device = jmap.device
 
             # index: [N_TYPE, K]
@@ -181,16 +205,26 @@ class LineVectorizer(nn.Module):
 
             # xy: [N_TYPE * K, 2]
             # match: [N_TYPE, K]
+            # print(match.shape)
+            # print(cost.shape)
+            # print(jtyp.shape)
+            # print("n_type", n_type)
             for t in range(n_type):
+                # print(t)
+                # print(match[t, :])
                 match[t, jtyp[match[t]] != t] = N
+            # print(cost > 1.5 * 1.5)
             match[cost > 1.5 * 1.5] = N
             match = match.flatten()
 
             _ = torch.arange(n_type * K, device=device)
             u, v = torch.meshgrid(_, _)
             u, v = u.flatten(), v.flatten()
+            # print(match, u, v)
             up, vp = match[u], match[v]
+            # print(up, vp)
             label = Lpos[up, vp]
+            # print("sample line label",Lpos.shape,up.shape,vp.shape,label.shape)
 
             c = (u < v).flatten()
 
@@ -211,10 +245,18 @@ class LineVectorizer(nn.Module):
                 ],
                 1,
             )
+            #  print(M.use_cood, M.use_slop)
             line = torch.cat([xyu[:, None], xyv[:, None]], 1)
+            # print(line.shape)
 
             xy = xy.reshape(n_type, K, 2)
+            # print(xy.shape)
+            # print(n_type)
             jcs = [xy[i, score[i] > 0.03] for i in range(n_type)]
+            # print(jcs)
+            # print(xy[0, :, :])
+            # print(np.array(jcs).shape)
+            # print(label, label.shape)
             return line, label.float(), feat, jcs
 
 
